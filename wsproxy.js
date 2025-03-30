@@ -97,7 +97,7 @@ let srv = {
   /* enable additional debugging */
   debug: true,
   /* use node zlib (different from mccp) - you want this turned off unless your server can't do MCCP and your client can inflate data */
-  compress: false,
+  compress: true,
   /* set to false while server is shutting down */
   open: true,
 
@@ -212,6 +212,13 @@ let srv = {
         key: fs.readFileSync(certFiles.privkey),
         minVersion: 'TLSv1.2'
       }, (req, res) => {
+        // Log all HTTPS requests
+        srv.log('HTTPS Request:', {
+          method: req.method,
+          url: req.url,
+          headers: req.headers
+        });
+
         // Handle CORS preflight
         if (req.method === 'OPTIONS') {
           res.writeHead(200, {
@@ -254,15 +261,44 @@ let srv = {
       });
 
       wsServer.on('connection', (ws, req) => {
-        srv.log('WebSocket connected');
+        ws.remoteAddress = req.socket.remoteAddress;
+
+        srv.log('WebSocket connected:', {
+          remoteAddress: ws.remoteAddress,
+          url: req.url
+        });
+
+        ws.on('message', function(data, isBinary) {
+          srv.log('Raw WebSocket message received:', {
+            isBinary,
+            dataType: typeof data,
+            dataLength: data.length,
+            dataString: isBinary ? '<binary>' : data.toString()
+          });
+
+          try {
+            srv.forward(ws, data);
+          } catch (err) {
+            srv.log('Error handling message:', err);
+          }
+        });
 
         ws.on('error', (error) => {
-          srv.log('WebSocket error:', error.toString());
+          srv.log('WebSocket error:', {
+            error: error.toString(),
+            remoteAddress: ws.remoteAddress
+          });
         });
 
         ws.on('close', (code, reason) => {
-          srv.log('WebSocket closed:', { code, reason });
+          srv.log('WebSocket closed:', {
+            code,
+            reason: reason.toString(),
+            remoteAddress: ws.remoteAddress
+          });
         });
+
+        srv.newSocket(ws);
       });
 
       // Start server
@@ -291,65 +327,34 @@ let srv = {
   },
 
   parse: function (s, d) {
-    if (d[0] != '{') return 0;
-
-    let req;
+    const messageStr = d.toString();
+    srv.log('Parsing message:', messageStr);
 
     try {
-      req = eval('(' + d + ')');
+      const req = JSON.parse(messageStr);
+      srv.log('Parsed request:', req);
+
+      if (req.host) {
+        s.host = req.host;
+        srv.log('Target host set to ' + s.host);
+      }
+
+      if (req.port) {
+        s.port = req.port;
+        srv.log('Target port set to ' + s.port);
+      }
+
+      if (req.connect) {
+        srv.log('Initiating telnet connection');
+        srv.initT(s);
+        return 1;
+      }
+
+      return 0;
     } catch (err) {
-      srv.log('parse: ' + err);
+      srv.log('Parse error:', err.toString());
       return 0;
     }
-
-    if (req.host) {
-      s.host = req.host;
-      srv.log('Target host set to ' + s.host, s);
-    }
-
-    if (req.port) {
-      s.port = req.port;
-      srv.log('Target port set to ' + s.port, s);
-    }
-
-    if (req.ttype) {
-      s.ttype = [req.ttype];
-      srv.log('Client ttype set to ' + s.ttype, s);
-    }
-
-    if (req.name) s.name = req.name;
-
-    if (req.client) s.client = req.client;
-
-    if (req.mccp) s.mccp = req.mccp;
-
-    if (req.utf8) s.utf8 = req.utf8;
-
-    if (req.debug) s.debug = req.debug;
-
-    if (req.chat) srv.chat(s, req);
-
-    if (req.connect) srv.initT(s);
-
-    if (req.bin && s.ts) {
-      try {
-        srv.log('Attempt binary send: ' + req.bin);
-        s.ts.send(Buffer.from(req.bin));
-      } catch (ex) {
-        srv.log(ex);
-      }
-    }
-
-    if (req.msdp && s.ts) {
-      try {
-        srv.log('Attempt msdp send: ' + stringify(req.msdp));
-        srv.sendMSDP(s, req.msdp);
-      } catch (ex) {
-        srv.log(ex);
-      }
-    }
-
-    return 1;
   },
 
   sendTTYPE: function (s, msg) {
@@ -411,6 +416,14 @@ let srv = {
     let host = s.host || srv.tn_host;
     let port = s.port || srv.tn_port;
 
+    srv.log('Initializing telnet connection:', {
+      clientAddress: s.remoteAddress,
+      targetHost: host,
+      targetPort: port,
+      hasHost: !!s.host,
+      hasPort: !!s.port
+    });
+
     if (!s.ttype) s.ttype = [];
 
     s.ttype = s.ttype.concat(srv.ttype.portal.slice(0));
@@ -440,20 +453,22 @@ let srv = {
       }
     }
 
-    s.ts = net.createConnection(port, host, function () {
-      srv.log(
-        'new connection to ' + host + ':' + port + ' for ' + s.remoteAddress,
-      );
-    });
+    s.ts = net.createConnection(port, host);
 
-    // s.ts.setEncoding('binary');
+    s.ts.on('connect', function() {
+      srv.log('Telnet connection established:', {
+        host,
+        port,
+        clientAddress: s.remoteAddress
+      });
+    });
 
     s.ts.send = function (data) {
       if (srv.debug) {
         let raw = [];
         for (let i = 0; i < data.length; i++)
           raw.push(util.format('%d', data[i]));
-        srv.log('write bin: ' + raw.toString(), s);
+        // srv.log('write bin: ' + raw.toString(), s);
       }
 
       try {
@@ -506,9 +521,14 @@ let srv = {
         // srv.initT(s);
       })
       .on('error', function (err) {
-        srv.log('error: ' + err.toString());
-        // srv.sendClient(s, Buffer.from(err.toString()));
-        srv.sendClient(s, Buffer.from('Error: maybe the mud server is down?'));
+        srv.log('Telnet socket error:', {
+          error: err.toString(),
+          code: err.code,
+          host,
+          port,
+          clientAddress: s.remoteAddress
+        });
+        srv.sendClient(s, Buffer.from('Error connecting to MUD server: ' + err.message));
         setTimeout(function () {
           srv.closeSocket(s);
         }, 500);
@@ -762,8 +782,6 @@ let srv = {
       let raw = [];
       for (let i = 0; i < data.length; i++)
         raw.push(util.format('%d', data[i]));
-      srv.log('raw bin: ' + raw, s);
-      // srv.log('raw: ' + data, s);
     }
 
     if (!srv.compress || (s.mccp && s.compressed)) {
@@ -872,7 +890,17 @@ let srv = {
 
   log: function(...args) {
     const timestamp = new Date().toISOString();
-    console.log(timestamp + ' :', ...args);
+    // Only log the first level of objects
+    const processedArgs = args.map(arg => {
+      if (typeof arg === 'object' && arg !== null) {
+        return Object.fromEntries(
+          Object.entries(arg)
+            .filter(([_, v]) => typeof v !== 'object' || v === null)
+        );
+      }
+      return arg;
+    });
+    console.log(timestamp + ' :', ...processedArgs);
   },
 
   die: function (core) {
@@ -895,30 +923,53 @@ let srv = {
   newSocket: function (s) {
     if (!srv.open) {
       /* server is going down */
+      srv.log('Server is closing, rejecting new connection');
       s.terminate();
-      // s.destroy?s.destroy():s.socket.destroy();
       return;
     }
 
     server.sockets.push(s);
+    srv.log('Socket added to server.sockets array. Total sockets:', server.sockets.length);
 
     s.on('data', function (d) {
+      srv.log('Received data from client:', {
+        dataLength: d.length,
+        dataPreview: d.toString().substring(0, 100)
+      });
       srv.forward(s, d);
     });
 
     s.on('end', function () {
+      srv.log('Client socket ended connection');
       srv.closeSocket(s);
     });
 
-    s.on('error', function () {
+    s.on('error', function (err) {
+      srv.log('Client socket error:', err.toString());
       srv.closeSocket(s);
     });
 
-    srv.initT(s);
-    srv.log('(rs): new connection');
+    // Don't automatically initiate telnet connection
+    // Wait for the connect message from client
+    srv.log('New socket connected, waiting for connect message');
   },
 
   forward: function (s, d) {
+    srv.log('Forward called with data:', {
+      hasTs: !!s.ts,
+      dataLength: d.length,
+      dataPreview: d.toString().substring(0, 100)
+    });
+
+    // First try to parse as a connection request
+    if (!s.ts) {
+      srv.log('Attempting to parse connection request');
+      if (srv.parse(s, d)) {
+        srv.log('Successfully parsed connection request');
+        return;
+      }
+    }
+
     if (s.ts) {
       if (s.debug) {
         if (s.password_mode) {
@@ -934,6 +985,8 @@ let srv = {
       }
 
       s.ts.send(d);
+    } else {
+      srv.log('No telnet socket established yet, message dropped');
     }
   },
 };
@@ -971,4 +1024,39 @@ init().catch((err) => {
   console.error('Failed to initialize:', err);
   process.exit(1);
 });
+
+console.log('Creating WebSocket...');
+
+const ws = new WebSocket('wss://mud-proxy.whealinghold.net:8000');
+
+ws.onopen = () => {
+    console.log('Connected!');
+
+    const connectionRequest = {
+        host: "retromud.org",
+        port: 3000,
+        connect: 1
+    };
+
+    console.log('Sending connection request:', connectionRequest);
+    ws.send(JSON.stringify(connectionRequest));
+};
+
+ws.onmessage = (event) => {
+    try {
+        // The server sends base64 encoded data
+        const decoded = atob(event.data);
+        console.log('From MUD:', decoded);
+    } catch (err) {
+        console.log('Raw message:', event.data);
+    }
+};
+
+ws.onerror = (error) => {
+    console.log('WebSocket error:', error);
+};
+
+ws.onclose = (event) => {
+    console.log('WebSocket closed:', event.code, event.reason);
+};
 
