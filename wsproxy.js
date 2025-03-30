@@ -1,30 +1,30 @@
-/*  
+/*
   Lightweight Websocket <-> Telnet Proxy
   v1.3 - 2/27/2014 @plamzi
   v2.0 - ?? @neverbot
   v3.0 - March 2025 @neverbot
-  
-  Author: plamzi - plamzi@gmail.com 
+
+  Author: plamzi - plamzi@gmail.com
   Contributor: neverbot
   MIT license
-  
+
   Supports client setting any host and port prior to connect.
-  
+
   Example (client-side JS):
-  
+
     if (WebSocket) {
       let ws = new WebSocket('ws://mywsproxyserver:6200/');
-      ws.onopen = function(e) { 
+      ws.onopen = function(e) {
         ws.send('{ host: "localhost", port: 7000, connect: 1 }');
       };
     }
-  
+
   Usage Notes:
-    
+
     The server waits to receive { "connect": 1 } to begin connecting to
     a telnet client on behalf of the user, so you have to send it
     even if you are not passing it host and port from the client.
-    
+
     JSON requests with { "chat": 1 } will be intercepted and handled
     by the basic in-proxy chat system.
 */
@@ -39,7 +39,7 @@ import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 
 import { minify } from 'uglify-js';
-import ws from 'ws';
+import { WebSocketServer } from 'ws';
 import iconv from 'iconv-lite';
 // iconv.extendNodeEncodings(); // Kept commented as in original
 
@@ -89,26 +89,26 @@ const loadChatLog = async () => {
 let srv = {
   path: __dirname,
   /* this websocket proxy port */
-  ws_port: 6200,
+  ws_port: 8000,
   /* default telnet host */
-  tn_host: 'muds.maldorne.org',
+  tn_host: 'retromud.org',
   /* default telnet/target port */
-  tn_port: 5010,
+  tn_port: 3000,
   /* enable additional debugging */
-  debug: false,
+  debug: true,
   /* use node zlib (different from mccp) - you want this turned off unless your server can't do MCCP and your client can inflate data */
-  compress: true,
+  compress: false,
   /* set to false while server is shutting down */
   open: true,
 
   ttype: {
     enabled: 1,
-    portal: ['maldorne.org', 'XTERM-256color', 'MTTS 141'],
+    portal: ['retromud.org', 'XTERM-256color', 'MTTS 141'],
   },
 
   gmcp: {
     enabled: 1,
-    portal: ['client maldorne.org', 'client_version 1.0'],
+    portal: ['client retromud.org', 'client_version 1.0'],
   },
 
   prt: {
@@ -187,83 +187,100 @@ let srv = {
     //   srv.log('(ws) server listening: port ' + srv.ws_port);
     // });
 
-    if (fs.existsSync('./cert.pem') && fs.existsSync('./privkey.pem')) {
-      webserver = https.createServer({
-        cert: fs.readFileSync('./cert.pem'),
-        key: fs.readFileSync('./privkey.pem'),
-      });
-    } else {
-      // TODO: maybe fallback to non secure connection
-      srv.log('Could not find cert and/or privkey files, exiting.');
-      process.exit();
+    // Create HTTPS server with complete certificate chain
+    const certFiles = {
+      fullchain: './fullchain.pem',
+      privkey: './privkey.pem'
+    };
+
+    // Check which files are missing
+    const missingFiles = Object.entries(certFiles)
+      .filter(([_, path]) => !fs.existsSync(path))
+      .map(([name, _]) => name);
+
+    if (missingFiles.length > 0) {
+      srv.log(`Missing certificate files: ${missingFiles.join(', ')}`);
+      srv.log('Please ensure all certificate files are in the correct location.');
+      process.exit(1);
     }
 
-    webserver.listen(srv.ws_port, function () {
-      srv.log('(ws) server listening: port ' + srv.ws_port);
-    });
+    try {
+      srv.log('Starting server setup...');
 
-    // Fix: Create WebSocketServer correctly
-    wsServer = new ws.Server({
-      server: webserver,
-      // httpServer: webserver,
-      // autoAcceptConnections: false,
-      // keepalive: true
-    });
-
-    wsServer.on('connection', function connection(socket, req) {
-      srv.log('(ws on connection) new connection');
-      if (!srv.open) {
-        socket.terminate();
-        return;
-      }
-
-      if (!srv.originAllowed(req.headers.origin)) {
-        socket.terminate();
-        return;
-      }
-
-      if (!socket.req) socket.req = req;
-
-      // Add compatibility methods for the WebSocket
-      socket.sendUTF = socket.send.bind(socket);
-      socket.terminate = socket.close.bind(socket);
-
-      server.sockets.push(socket);
-      srv.log('(ws on connection) connection count: ' + server.sockets.length);
-
-      socket.on('message', function message(msg) {
-        // if (msg.type === 'utf8') {
-        // msg = msg.utf8Data;
-        if (!srv.parse(socket, msg)) {
-          srv.forward(socket, msg);
+      const server = https.createServer({
+        cert: fs.readFileSync(certFiles.fullchain),
+        key: fs.readFileSync(certFiles.privkey),
+        minVersion: 'TLSv1.2'
+      }, (req, res) => {
+        // Handle CORS preflight
+        if (req.method === 'OPTIONS') {
+          res.writeHead(200, {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers': '*',
+            'Access-Control-Max-Age': '86400'
+          });
+          res.end();
+          return;
         }
-        // }
-        // else {
-        //   srv.log('unrecognized msg type: ' + msg.type);
-        // }
+
+        // Regular response
+        res.writeHead(200, {
+          'Content-Type': 'text/plain',
+          'Access-Control-Allow-Origin': '*'
+        });
+        res.end('HTTPS and WebSocket server running\n');
       });
 
-      socket.on('close', () => {
-        srv.log(
-          new Date().toISOString() +
-            ' (ws) peer ' +
-            socket.req.connection.remoteAddress +
-            ' disconnected.',
-        );
-        srv.closeSocket(socket);
+      // Log TLS connection attempts
+      server.on('secureConnection', (tlsSocket) => {
+        srv.log('TLS Connection:', {
+          authorized: tlsSocket.authorized,
+          protocol: tlsSocket.getProtocol(),
+          cipher: tlsSocket.getCipher()
+        });
       });
 
-      socket.on('error', (error) => {
-        srv.log(
-          new Date().toISOString() +
-            ' (ws) peer ' +
-            socket.req.connection.remoteAddress +
-            ' error: ' +
-            error,
-        );
-        srv.closeSocket(socket);
+      // Log connection errors
+      server.on('tlsClientError', (err) => {
+        srv.log('TLS Error:', err.message);
       });
-    });
+
+      // Create WebSocket server
+      wsServer = new WebSocketServer({
+        server: server,
+        perMessageDeflate: false,
+        clientTracking: true
+      });
+
+      wsServer.on('connection', (ws, req) => {
+        srv.log('WebSocket connected');
+
+        ws.on('error', (error) => {
+          srv.log('WebSocket error:', error.toString());
+        });
+
+        ws.on('close', (code, reason) => {
+          srv.log('WebSocket closed:', { code, reason });
+        });
+      });
+
+      // Start server
+      server.listen(srv.ws_port, '0.0.0.0', () => {
+        const addr = server.address();
+        srv.log('Server listening:', {
+          address: addr.address,
+          port: addr.port,
+          family: addr.family
+        });
+      });
+
+    } catch (error) {
+      srv.log('Error during server creation:');
+      srv.log(error.toString());
+      srv.log(error.stack);
+      process.exit(1);
+    }
 
     fs.watch(srv.path + '/wsproxy.js', function (e, f) {
       if (srv['update-' + f]) clearTimeout(srv['update-' + f]);
@@ -853,16 +870,9 @@ let srv = {
     return 1;
   },
 
-  log: function (msg, s) {
-    if (!s) s = { req: { connection: { remoteAddress: '' } } };
-    // eslint-disable-next-line no-console
-    console.log(
-      util.format(
-        new Date().toISOString() + ' %s: %s',
-        s.req.connection.remoteAddress,
-        msg,
-      ),
-    );
+  log: function(...args) {
+    const timestamp = new Date().toISOString();
+    console.log(timestamp + ' :', ...args);
   },
 
   die: function (core) {
@@ -961,3 +971,4 @@ init().catch((err) => {
   console.error('Failed to initialize:', err);
   process.exit(1);
 });
+
